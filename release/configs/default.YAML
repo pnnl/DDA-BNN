@@ -1,5 +1,5 @@
 # ---------------- Data ----------------
-ROOT_DIR: ".."          # project root (relative to training/)
+ROOT_DIR: ".."          # project root (relative to release/)
 DATA_FILE: "data/DDA_dataset_extended_JAN.csv"
 
 FEATURES:

@@ -34,13 +34,21 @@ def _apply(d: dict[str, Any]) -> None:
 
 def _post() -> None:
     """Resolve paths and device after every load/override."""
-    root = Path(globals()["ROOT_DIR"]).resolve()
+    this_dir = Path(__file__).resolve().parent
+    root = Path(globals()["ROOT_DIR"]).expanduser()
+    if not root.is_absolute():
+        root = this_dir / root
+    root = root.resolve()
     globals()["ROOT_DIR"] = root
     ns.ROOT_DIR = root
 
-    globals()["DATA_FILE"] = ns.DATA_FILE = root / globals()["DATA_FILE"]
-    globals()["ARTIFACT_DIR"] = ns.ARTIFACT_DIR = root / globals()["ARTIFACT_DIR"]
-    ns.ARTIFACT_DIR.mkdir(exist_ok=True)
+    for key in ("DATA_FILE", "ARTIFACT_DIR"):
+        path = Path(globals()[key]).expanduser()
+        if not path.is_absolute():
+            path = root / path
+        globals()[key] = path
+        setattr(ns, key, path)
+    ns.ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 
     globals()["DEVICE"] = ns.DEVICE = _device(globals()["DEVICE"])
 
