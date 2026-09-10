@@ -67,10 +67,32 @@ def find_latest_run_dir(root: str | Path | None = None) -> Path:
 
 
 # ---------------- utils (keep yours) ----------------
-def apply_config_used(cfg_module, cfg_dict: dict):
-    for k, v in (cfg_dict or {}).items():
+_BASE_CONFIG = {
+    key: getattr(cfg, key)
+    for key in getattr(cfg, "_baseline", {})
+    if hasattr(cfg, key)
+}
+
+def apply_config_used(cfg_module, cfg_dict: dict | None):
+    if cfg_dict is None:
+        return
+    if not isinstance(cfg_dict, dict):
+        raise ValueError("config_used.yaml must contain a mapping")
+
+    namespace = getattr(cfg_module, "ns", None)
+    for k, v in cfg_dict.items():
         if k.isupper() and hasattr(cfg_module, k):
             setattr(cfg_module, k, v)
+            if namespace is not None:
+                setattr(namespace, k, v)
+
+def _apply_run_config(run_dir: Path) -> None:
+    """Reset to baseline, then apply the selected run's saved configuration."""
+    apply_config_used(cfg, _BASE_CONFIG)
+    cfg_path = run_dir / "config_used.yaml"
+    if cfg_path.exists():
+        with cfg_path.open("r", encoding="utf-8") as stream:
+            apply_config_used(cfg, yaml.safe_load(stream))
 
 def resolve_run_dir(model_dir: str | Path) -> Path:
     p = Path(model_dir).expanduser()
@@ -109,15 +131,30 @@ def inverse_phys_tf(arr: np.ndarray, tf_info: dict, tf_eps: float) -> np.ndarray
             raise ValueError(f"Unknown tf '{tf}' for target '{col}'")
     return out
 
-def _taus_to_array(taus: None | dict[str, float] | np.ndarray | torch.Tensor, dtype) -> torch.Tensor | None:
+def _taus_to_array(
+    taus: None | dict[str, float] | np.ndarray | torch.Tensor,
+    dtype,
+) -> torch.Tensor | None:
     if taus is None:
         return None
     if isinstance(taus, dict):
-        arr = torch.tensor([float(taus[t]) for t in cfg.TARGETS], dtype=dtype)
+        missing = [target for target in cfg.TARGETS if target not in taus]
+        if missing:
+            raise ValueError(
+                "taus mapping is missing target(s): " + ", ".join(missing)
+            )
+        arr = torch.tensor(
+            [float(taus[target]) for target in cfg.TARGETS],
+            dtype=dtype,
+        )
     else:
         arr = torch.as_tensor(taus, dtype=dtype)
     if arr.ndim != 1 or arr.shape[0] != len(cfg.TARGETS):
         raise ValueError(f"taus must be shape (D,), got {tuple(arr.shape)}")
+    if not bool(torch.isfinite(arr).all()):
+        raise ValueError("taus must contain only finite values")
+    if bool((arr < 0).any()):
+        raise ValueError("taus must be non-negative")
     return arr
 
 
@@ -131,12 +168,12 @@ def _load_taus_from_run_dir(run_dir: Path) -> dict[str, float] | None:
 
 
 def _resolve_taus(taus, run_dir: Path, dtype):
-    """Resolve the taus argument:
-    - "auto" → load from run_dir/taus.json (None if missing)
-    - None   → no scaling
-    - dict / array / tensor → use directly
-    """
-    if isinstance(taus, str) and taus.lower() == "auto":
+    """Resolve automatic or explicit uncertainty-temperature scaling."""
+    if isinstance(taus, str):
+        if taus.casefold() != "auto":
+            raise ValueError(
+                "taus string value must be 'auto'; use None to disable scaling"
+            )
         taus = _load_taus_from_run_dir(run_dir)
     return _taus_to_array(taus, dtype)
 
@@ -168,10 +205,7 @@ def run_inference_latent(
       - dict / array / tensor → use directly
     """
     run_dir = resolve_run_dir(model_dir)
-    cfg_path = run_dir / "config_used.yaml"
-    if cfg_path.exists():
-        with cfg_path.open("r") as f:
-            apply_config_used(cfg, yaml.safe_load(f))
+    _apply_run_config(run_dir)
 
     if device is None:
         device = torch.device(cfg.DEVICE) if isinstance(cfg.DEVICE, str) else cfg.DEVICE
@@ -290,13 +324,21 @@ def run_inference_phys(
       mean_phys, std_ale_phys, std_epi_phys, std_tot_phys, q_out
     """
     run_dir = resolve_run_dir(model_dir)
+    # Apply the saved run configuration before reading TF_EPS. The nested
+    # latent call applies the same run config again, which is idempotent.
+    _apply_run_config(run_dir)
 
     meta = torch.load(run_dir / "data_meta.pt", map_location="cpu", weights_only=False)
     tf_info = meta["tf_info"]
     tf_eps = cfg.TF_EPS
 
+    # NOTE: taus=None here is deliberate. run_inference_latent() defaults to
+    # "auto" (auto-loading taus.json) when called on its own, but this function
+    # applies its own calibration below using samples straight from the
+    # posterior. Letting run_inference_latent also calibrate here would apply
+    # the tau factor twice (approximately squaring it).
     mu_lat_mean, std_ale_lat, std_epi_lat, mu_lat_s, std_ale_lat_s = run_inference_latent(
-        run_dir, x_raw, device=device, num_mc=num_mc, seed=seed, return_samples=True
+        run_dir, x_raw, device=device, num_mc=num_mc, seed=seed, return_samples=True, taus=None,
     )
     if mu_lat_s is None:
         raise RuntimeError("return_samples=True failed to produce mu_lat_s")
