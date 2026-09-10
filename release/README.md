@@ -62,6 +62,10 @@ mean, std_ale, std_epi, std_tot, q_out = run_inference_phys(
 )
 ```
 
+Both inference entry points default to `taus="auto"`, which loads
+`taus.json` from the resolved model run when it is present. Pass
+`taus=None` explicitly to request raw, uncalibrated uncertainty.
+
 **Returns** (all NumPy arrays of shape `(N, 3)` for targets Qext, SSA, g):
 
 | Output | Description |
