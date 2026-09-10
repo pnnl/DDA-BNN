@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - release/1.0.2
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python 3.11 smoke tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        shell: bash -el {0}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Create Conda environment
+        uses: conda-incubator/setup-miniconda@8ee1f361103df19b6f8c8655fd3967a8ecb162d5 # v4.0.1
+        with:
+          activate-environment: bnn_notebook_env
+          environment-file: environment.yml
+          miniforge-version: 26.5.3-0
+          conda-solver: libmamba
+
+      - name: Check Python syntax and warnings
+        run: >-
+          python -W error::SyntaxWarning -m compileall -q
+          release
+          training
+          analysis
+          tests
+          data/ADDA_run_example/make_orientations.py
+
+      - name: Run repository tests
+        run: python -m unittest discover -s tests -v
