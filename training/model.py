@@ -131,7 +131,11 @@ class HybridNet(PyroModule):
         eps = 1e-6
         mode = cfg.UNCERTAINTY_MODE.lower()
 
-        if mode == "diag":
+        if mode == "none":
+            # No learned aleatoric head: use a fixed unit observation scale
+            # in training's target space. Epistemic uncertainty is still learned.
+            dist_y = dist.Normal(out, torch.ones_like(out)).to_event(1)
+        elif mode == "diag":
             mu, raw = out[:, :d], out[:, d:]
 
             # Map raw -> bounded log-variance, then to variance/std for the Normal
