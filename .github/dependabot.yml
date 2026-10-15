@@ -1,0 +1,36 @@
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: daily
+
+    cooldown:
+      default-days: 5
+
+    groups:
+      github-actions-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Conda manifest version updates only (environment.yml); Dependabot does
+  # not update Conda lockfiles or perform a complete vulnerability scan.
+  - package-ecosystem: conda
+    directory: /
+    schedule:
+      interval: daily
+
+    cooldown:
+      default-days: 5
+
+    groups:
+      conda-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
