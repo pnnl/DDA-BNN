@@ -60,11 +60,17 @@ def _apply_target_forward(df_targets):
 # helper: dummy scaler when Z-score is disabled
 # ──────────────────────────────────────────────────────────────────────
 class IdentityScaler:
-    def fit(self, x):               return self
+    """No-op scaler; NaN means missing and maps to zero at the caller boundary."""
+    def fit(self, x):
+        x = np.asarray(x)
+        if x.ndim != 2:
+            raise ValueError("IdentityScaler expects a 2-D input array")
+        self._dim = x.shape[1]
+        return self
 
     def transform(self, x):         return x
 
-    def fit_transform(self, x):     return x
+    def fit_transform(self, x):     return self.fit(x).transform(x)
 
     def inverse_transform(self, x): return x
 
@@ -73,6 +79,12 @@ class IdentityScaler:
 
     @scale_.setter
     def scale_(self, v):            self._dim = len(v)
+
+    @property
+    def n_features_in_(self):      return self._dim
+
+    @property
+    def mean_(self):               return np.zeros(self._dim)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -185,6 +197,9 @@ def load_dataset(path: Path,
     cols.extend(low_res_cols)
 
     X_raw = np.column_stack(cols)
+    # Missing values use NaN; infinity is never a valid input to the network.
+    if np.isinf(X_raw).any():
+        raise ValueError("Infinite feature values are invalid; use NaN for missing")
     low_res_raw = X_raw[:, -len(targets):]
 
     # ------------------ build y_raw (latent/forward-transformed) -------
@@ -214,7 +229,13 @@ def load_dataset(path: Path,
         x_scaler = IdentityScaler(); x_scaler.scale_ = np.ones(X_raw.shape[1])
         y_scaler = IdentityScaler(); y_scaler.scale_ = np.ones(y_raw_np.shape[1])
 
-        X_tr, X_va, X_te = X_raw[idx_tr], X_raw[idx_va], X_raw[idx_te]
+        # In no-scaling mode, missing features still need the same zero fill
+        # as production inference; never pass NaNs through to the network.
+        # This zero is in raw units and may not be physically neutral for
+        # size/morphology features; changing the imputation policy requires
+        # a separate modeling decision and retraining.
+        X_tr, X_va, X_te = (np.where(np.isnan(X_raw[idx]), 0.0, X_raw[idx])
+                             for idx in (idx_tr, idx_va, idx_te))
         y_tr, y_va, y_te = y_raw_np[idx_tr], y_raw_np[idx_va], y_raw_np[idx_te]
 
     # -----------------------------------------------------------------

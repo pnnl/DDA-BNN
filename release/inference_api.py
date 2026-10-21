@@ -70,8 +70,14 @@ def resolve_run_dir(model_dir: Union[str, Path]) -> Path:
 def scale_like_training_np(X_raw: np.ndarray, x_scaler) -> np.ndarray:
     """Scale input features using the training scaler, handling NaN values."""
     X_raw = np.asarray(X_raw, dtype=np.float32)
+    # Only NaN denotes a missing feature; infinity is invalid, not missing.
+    if np.isinf(X_raw).any():
+        raise ValueError("Infinite feature values are invalid; use NaN for missing")
     mask = np.isnan(X_raw)
-    filled = np.where(mask, np.nanmean(X_raw, axis=0), X_raw)
+    # Supply finite, training-derived placeholders to the scaler; the values
+    # at missing coordinates are overwritten below. Final policy: a missing
+    # feature is zero in model-input space, not a batch-specific raw mean.
+    filled = np.where(mask, x_scaler.mean_, X_raw)
     X_scaled = x_scaler.transform(filled)
     X_scaled[mask] = 0.0
     return X_scaled
@@ -151,7 +157,7 @@ def run_inference_latent(
     y_scaler = meta["y_scaler"]
 
     X = x_raw.detach().cpu().numpy().astype(np.float32) if isinstance(x_raw, torch.Tensor) else np.asarray(x_raw, dtype=np.float32)
-    n_expected = int(getattr(x_scaler, "n_features_in_", None) or x_scaler.mean_.shape[0])
+    n_expected = int(getattr(x_scaler, "n_features_in_", None) or x_scaler.scale_.shape[0])
     if X.ndim != 2 or X.shape[1] != n_expected:
         raise ValueError(f"Input must have shape (N,{n_expected}), got {X.shape}")
     xb = torch.tensor(scale_like_training_np(X, x_scaler), dtype=torch.float32, device=device)
