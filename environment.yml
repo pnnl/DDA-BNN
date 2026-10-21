@@ -24,4 +24,6 @@ dependencies:
   - notebook
   - ipykernel
 
+  # The CI suite contains both unittest-style and pytest-function tests.
+  - pytest
   - pip
