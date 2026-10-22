@@ -498,14 +498,34 @@ def _serialisable(x):
         return x.item()
     return x
 
-def make_deterministic_guide(bnn):
-    # assume guide has parameters "loc" and "scale_unconstrained"
-    def guide(*args, **kwargs):
-        for name, value in pyro.get_param_store().items():
-            if name.endswith("scale_unconstrained"):
-                pyro.param(name).data.fill_(-10.0)     # sigma ≈ 0
-        return bnn.guide(*args, **kwargs)
-    return guide
+def _freeze_guide_scales(model):
+    """Freeze the guide's actual unconstrained leaves; retain values to restore.
+
+    ParamStore.items() exposes constrained names such as guide.scale, not
+    the module's scale_unconstrained leaf. Keep variational weight scales
+    independent of the observation head's LOG_VAR_MIN/MAX configuration.
+    """
+    state = []
+    for name, parameter in model.guide.named_parameters():
+        if name == "scale_unconstrained" or name.endswith(".scale_unconstrained"):
+            state.append((parameter, parameter.detach().clone(), parameter.requires_grad))
+    if not state:
+        raise RuntimeError("No initialized variational scale parameters found for warmup")
+    for parameter, _, _ in state:
+        parameter.requires_grad_(False)
+        parameter.grad = None
+        with torch.no_grad():
+            parameter.fill_(-10.0)  # existing near-deterministic warmup scale
+    return state
+
+
+def _restore_guide_scales(state):
+    """Restore the pre-warmup guide scale and its gradient flag exactly once."""
+    for parameter, value, requires_grad in state:
+        with torch.no_grad():
+            parameter.copy_(value)
+        parameter.grad = None
+        parameter.requires_grad_(requires_grad)
 
 # ----------------------------------------------------------------------
 def main():
@@ -565,38 +585,10 @@ def main():
         adam = ClippedAdam(lr_cfg)  # ONE optimiser object, reused
 
 
-    ALPHA0 = 0.05  # small but > 0
-
-
-    def set_scale_requires_grad(require_grad: bool, init_val: float = None):
-        """
-        enable/disable gradients of all variational log-scale parameters.
-        If init_val is given, also set their value.
-        """
-        for name, p in pyro.get_param_store().items():
-            if name.endswith("scale_unconstrained"):
-                p.requires_grad = require_grad
-                if init_val is not None:
-                    p.data.fill_(init_val)
-
+    warmup_state = None
     if is_bnn and cfg.DET_WARMUP > 0:
-        set_scale_requires_grad(False, init_val=-10.0)  # σ ≈ 0
-
-    # ------------------------------------------------------------------
-
-    def alpha_beta(epoch: int):
-        # no beta scheduling; standard ELBO always
-        return 1.0, 1.0
-
-
-    if is_bnn and cfg.DET_WARMUP > 0:
-        for name, p in pyro.get_param_store().items():
-            if name.endswith("scale_unconstrained"):
-                p.requires_grad = False
-                p.data.fill_(-10.0)  # σw ≈ 0
-        model.use_predicted_std = False  # ignore σ̂ during DET phase
-
-    frozen_flag = False
+        warmup_state = _freeze_guide_scales(model)
+        model.use_predicted_std = False
 
     for epoch in range(1, cfg.EPOCHS + 1):
 
@@ -609,18 +601,12 @@ def main():
 
 
 
-            # unfreeze variational scales after deterministic warmup
-            if epoch > cfg.DET_WARMUP and not any(
-                    p.requires_grad for n, p in pyro.get_param_store().items()
-                    if n.endswith("scale_unconstrained")):
-                for name, p in pyro.get_param_store().items():
-                    if name.endswith("scale_unconstrained"):
-                        p.requires_grad = True
-                        p.data.fill_(cfg.LOG_VAR_MIN + 0.1)
+            # Transition once, retaining the same leaf parameters and optimizer.
+            if warmup_state is not None and epoch > cfg.DET_WARMUP:
+                _restore_guide_scales(warmup_state)
+                warmup_state = None
                 model.use_predicted_std = True
-                if not frozen_flag:
-                    frozen_flag = True
-                    print(f"[INFO] Variance parameters unfrozen at epoch {epoch}")
+                print(f"[INFO] Variance parameters unfrozen at epoch {epoch}")
 
             tr_tot, tr_nll, tr_kl = train_one_epoch(model, train_loader, beta=beta, svi=svi)
             va_tot, va_nll, va_kl = loss_on_loader(model, val_loader, beta=beta, svi=svi)
