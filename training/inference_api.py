@@ -67,10 +67,41 @@ def find_latest_run_dir(root: str | Path | None = None) -> Path:
 
 
 # ---------------- utils (keep yours) ----------------
-def apply_config_used(cfg_module, cfg_dict: dict):
-    for k, v in (cfg_dict or {}).items():
-        if k.isupper() and hasattr(cfg_module, k):
+# Saved run configs include machine-specific runtime state. Inference replays
+# only model semantics; paths and DEVICE belong to the current host.
+# CONTRACT: cfg and Pyro's parameter store are process-global and mutated by
+# run_inference_*; do not interleave calls for different runs in one process.
+# Serialize inference calls or isolate each model run in a separate process.
+# Model directories must be trusted: torch.load(weights_only=False) can execute
+# arbitrary code when deserializing malicious pickle data.
+_RUNTIME_CONFIG_KEYS = frozenset({"ROOT_DIR", "DATA_FILE", "ARTIFACT_DIR", "DEVICE"})
+_BASE_CONFIG = {
+    key: getattr(cfg, key)
+    for key in getattr(cfg, "_baseline", {})
+    if key not in _RUNTIME_CONFIG_KEYS and hasattr(cfg, key)
+}
+
+def apply_config_used(cfg_module, cfg_dict: dict | None):
+    if cfg_dict is None:
+        return
+    if not isinstance(cfg_dict, dict):
+        raise ValueError("config_used.yaml must contain a mapping")
+
+    namespace = getattr(cfg_module, "ns", None)
+    valid_keys = set(_BASE_CONFIG)
+    for k, v in cfg_dict.items():
+        if k in valid_keys and hasattr(cfg_module, k):
             setattr(cfg_module, k, v)
+            if namespace is not None:
+                setattr(namespace, k, v)
+
+def _apply_run_config(run_dir: Path) -> None:
+    """Reset semantic config, then apply the selected run's saved configuration."""
+    apply_config_used(cfg, _BASE_CONFIG)
+    cfg_path = run_dir / "config_used.yaml"
+    if cfg_path.exists():
+        with cfg_path.open("r", encoding="utf-8") as stream:
+            apply_config_used(cfg, yaml.safe_load(stream))
 
 def resolve_run_dir(model_dir: str | Path) -> Path:
     p = Path(model_dir).expanduser()
@@ -109,15 +140,36 @@ def inverse_phys_tf(arr: np.ndarray, tf_info: dict, tf_eps: float) -> np.ndarray
             raise ValueError(f"Unknown tf '{tf}' for target '{col}'")
     return out
 
-def _taus_to_array(taus: None | dict[str, float] | np.ndarray | torch.Tensor, dtype) -> torch.Tensor | None:
+def _taus_to_array(
+    taus: None | dict[str, float] | np.ndarray | torch.Tensor,
+    dtype,
+) -> torch.Tensor | None:
     if taus is None:
         return None
     if isinstance(taus, dict):
-        arr = torch.tensor([float(taus[t]) for t in cfg.TARGETS], dtype=dtype)
+        target_names = set(cfg.TARGETS)
+        missing = [target for target in cfg.TARGETS if target not in taus]
+        if missing:
+            raise ValueError(
+                "taus mapping is missing target(s): " + ", ".join(missing)
+            )
+        unexpected = sorted(set(taus) - target_names)
+        if unexpected:
+            raise ValueError(
+                "taus mapping has unexpected target(s): " + ", ".join(unexpected)
+            )
+        arr = torch.tensor(
+            [float(taus[target]) for target in cfg.TARGETS],
+            dtype=dtype,
+        )
     else:
         arr = torch.as_tensor(taus, dtype=dtype)
     if arr.ndim != 1 or arr.shape[0] != len(cfg.TARGETS):
         raise ValueError(f"taus must be shape (D,), got {tuple(arr.shape)}")
+    if not bool(torch.isfinite(arr).all()):
+        raise ValueError("taus must contain only finite values")
+    if bool((arr <= 0).any()):
+        raise ValueError("taus must be strictly positive")
     return arr
 
 
@@ -131,12 +183,12 @@ def _load_taus_from_run_dir(run_dir: Path) -> dict[str, float] | None:
 
 
 def _resolve_taus(taus, run_dir: Path, dtype):
-    """Resolve the taus argument:
-    - "auto" → load from run_dir/taus.json (None if missing)
-    - None   → no scaling
-    - dict / array / tensor → use directly
-    """
-    if isinstance(taus, str) and taus.lower() == "auto":
+    """Resolve automatic or explicit uncertainty-temperature scaling."""
+    if isinstance(taus, str):
+        if taus.casefold() != "auto":
+            raise ValueError(
+                "taus string value must be 'auto'; use None to disable scaling"
+            )
         taus = _load_taus_from_run_dir(run_dir)
     return _taus_to_array(taus, dtype)
 
@@ -168,13 +220,12 @@ def run_inference_latent(
       - dict / array / tensor → use directly
     """
     run_dir = resolve_run_dir(model_dir)
-    cfg_path = run_dir / "config_used.yaml"
-    if cfg_path.exists():
-        with cfg_path.open("r") as f:
-            apply_config_used(cfg, yaml.safe_load(f))
+    _apply_run_config(run_dir)
 
     if device is None:
         device = torch.device(cfg.DEVICE) if isinstance(cfg.DEVICE, str) else cfg.DEVICE
+    else:
+        device = torch.device(device)
     num_mc = int(num_mc or getattr(cfg, "BAYES_NUM_SAMPLES", 50))
 
     meta = torch.load(run_dir / "data_meta.pt", map_location="cpu", weights_only=False)
@@ -187,7 +238,18 @@ def run_inference_latent(
         raise ValueError(f"Input must have shape (N,{n_expected}), got {X.shape}")
     xb = torch.tensor(scale_like_training_np(X, x_scaler), dtype=torch.float32, device=device)
 
-    model = HybridNet(xb.shape[1]).to(device)
+    # HybridNet creates Bayesian priors on cfg.DEVICE. Temporarily synchronize
+    # that construction-time setting with the caller-selected inference device
+    # without allowing a saved training DEVICE to leak into future calls.
+    previous_device = cfg.DEVICE
+    previous_ns_device = cfg.ns.DEVICE
+    cfg.DEVICE = cfg.ns.DEVICE = device
+    try:
+        model = HybridNet(xb.shape[1]).to(device)
+    finally:
+        cfg.DEVICE = previous_device
+        cfg.ns.DEVICE = previous_ns_device
+
     state = torch.load(run_dir / "model.pth", map_location=device, weights_only=False)
     state = {k: v for k, v in state.items() if not k.startswith("guide.")}
     model.load_state_dict(state, strict=False)
@@ -196,10 +258,22 @@ def run_inference_latent(
     pyro.set_rng_seed(seed)
     pyro.clear_param_store()
     pyro_path = run_dir / "pyro_params.pt"
-    has_pyro = pyro_path.exists() and getattr(model, "has_bayes", False)
+    has_pyro = getattr(model, "has_bayes", False)
     if has_pyro:
-        pyro.get_param_store().load(str(pyro_path))
+        if not pyro_path.is_file():
+            raise FileNotFoundError(f"Bayesian inference requires posterior parameters: {pyro_path}")
+        store = pyro.get_param_store()
+        store.load(str(pyro_path), map_location=device)
+        saved_names = set(store.keys())
         model.guide(xb[:1])
+        # AutoDiagonalNormal may initialize missing parameters during its
+        # first call. Such newly initialized values are not a saved posterior.
+        for name, parameter in model.guide.named_parameters():
+            stored_name = store.param_name(parameter)
+            if stored_name not in saved_names:
+                raise ValueError(f"Saved posterior is missing guide parameter {name!r}")
+            if parameter.shape != (model.guide.latent_dim,) or not bool(torch.isfinite(parameter).all()):
+                raise ValueError(f"Saved posterior has invalid guide parameter {name!r}")
 
     if has_pyro:
         pred = pyro.infer.Predictive(model, guide=model.guide, num_samples=num_mc, return_sites=["_RETURN"])(xb)
@@ -254,17 +328,40 @@ def run_inference_latent(
 
 
 # ---------------- physical inference (Option B: use posterior samples) ----------------
-def stats_from_nested_cloud(y_kl: np.ndarray, quantiles=(0.05, 0.5, 0.95)):
+def stats_from_nested_cloud(y_kl: np.ndarray, quantiles=(0.05, 0.5, 0.95),
+                            *, epistemic_zero=None, aleatoric_zero=None):
+    """Estimate physical-space variance components from independent inner draws.
+
+    Remove finite-L Monte Carlo variance from the outer group means.
+    epistemic_zero/aleatoric_zero are known-absence masks broadcastable to
+    (N,D); they describe model components, not small estimated variances.
+    Corrected components are nonnegative and sum to total variance. Clipping
+    a noisy negative epistemic estimate at zero retains finite-sample bias.
+    Means and quantiles continue to use the original pooled sample cloud.
+    """
+    y_kl = np.asarray(y_kl, dtype=np.float64)
+    if y_kl.ndim != 4 or 0 in y_kl.shape or not np.isfinite(y_kl).all():
+        raise ValueError("Expected a nonempty finite (K,L,N,D) sample cloud")
     K, L, N, D = y_kl.shape
+    epi_zero = np.broadcast_to(False if epistemic_zero is None else epistemic_zero, (N, D))
+    ale_zero = np.broadcast_to(False if aleatoric_zero is None else aleatoric_zero, (N, D))
+    if L < 2 and not np.all(ale_zero):
+        raise ValueError("L must be at least 2 to estimate aleatoric variance")
     y_pool = y_kl.reshape(K * L, N, D)
-    mean = np.mean(y_pool, axis=0)
-    var_tot = np.var(y_pool, axis=0, ddof=0)
-    std_tot = np.sqrt(np.maximum(var_tot, 1e-24))
-    var_ale = np.mean(np.var(y_kl, axis=1, ddof=0), axis=0)  # E_k[Var_l]
-    var_epi = np.var(np.mean(y_kl, axis=1), axis=0, ddof=0)  # Var_k[E_l]
-    std_ale = np.sqrt(np.maximum(var_ale, 1e-24))
-    std_epi = np.sqrt(np.maximum(var_epi, 1e-24))
-    q_out = {f"q{int(round(q*100)):02d}": np.quantile(y_pool, q, axis=0) for q in quantiles}
+    mean = y_pool.mean(axis=0)
+    var_ale = (y_kl.var(axis=1, ddof=1).mean(axis=0)
+               if L > 1 else np.zeros((N, D)))
+    var_ale = np.where(ale_zero, 0.0, var_ale)
+    var_means = y_kl.mean(axis=1).var(axis=0, ddof=0)
+    # For a finite K-point ensemble, independent mean-estimation errors
+    # contribute (1 - 1/K) * E[Var(Y|w)] / L to this population variance.
+    var_epi = np.maximum(var_means - (1.0 - 1.0 / K) * var_ale / L, 0.0)
+    var_epi = np.where(epi_zero, 0.0, var_epi)
+    std_ale = np.sqrt(var_ale)
+    std_epi = np.sqrt(var_epi)
+    std_tot = np.sqrt(var_ale + var_epi)
+    q_out = {f"q{int(round(q * 100)):02d}": np.quantile(y_pool, q, axis=0)
+             for q in quantiles}
     return mean, std_ale, std_epi, std_tot, q_out
 
 
@@ -290,13 +387,21 @@ def run_inference_phys(
       mean_phys, std_ale_phys, std_epi_phys, std_tot_phys, q_out
     """
     run_dir = resolve_run_dir(model_dir)
+    # Apply the saved run configuration before reading TF_EPS. The nested
+    # latent call applies the same run config again, which is idempotent.
+    _apply_run_config(run_dir)
 
     meta = torch.load(run_dir / "data_meta.pt", map_location="cpu", weights_only=False)
     tf_info = meta["tf_info"]
     tf_eps = cfg.TF_EPS
 
+    # NOTE: taus=None here is deliberate. run_inference_latent() defaults to
+    # "auto" (auto-loading taus.json) when called on its own, but this function
+    # applies its own calibration below using samples straight from the
+    # posterior. Letting run_inference_latent also calibrate here would apply
+    # the tau factor twice (approximately squaring it).
     mu_lat_mean, std_ale_lat, std_epi_lat, mu_lat_s, std_ale_lat_s = run_inference_latent(
-        run_dir, x_raw, device=device, num_mc=num_mc, seed=seed, return_samples=True
+        run_dir, x_raw, device=device, num_mc=num_mc, seed=seed, return_samples=True, taus=None,
     )
     if mu_lat_s is None:
         raise RuntimeError("return_samples=True failed to produce mu_lat_s")
@@ -331,7 +436,14 @@ def run_inference_phys(
     # inverse transform to physical
     y = inverse_phys_tf(t.reshape(S_eff * L * N, D), tf_info, tf_eps).reshape(S_eff, L, N, D)
 
-    return stats_from_nested_cloud(y, quantiles=quantiles)
+    # Equal conditional distributions imply no epistemic variation in the
+    # sampled ensemble, including after nonlinear physical transforms.
+    epistemic_zero = (np.all(mu_lat_s_cal == mu_lat_s_cal[:1], axis=0) &
+                       np.all(std_ale_lat_s_cal == std_ale_lat_s_cal[:1], axis=0))
+    aleatoric_zero = np.all(std_ale_lat_s_cal == 0, axis=0)
+    return stats_from_nested_cloud(y, quantiles=quantiles,
+                                   epistemic_zero=epistemic_zero,
+                                   aleatoric_zero=aleatoric_zero)
 
 
 # ------------------------------------------------------------------ #

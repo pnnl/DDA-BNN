@@ -103,4 +103,6 @@ Key functions:
 - `run_inference_latent()` — predictions in latent (transformed) space
 - `run_inference_phys()` — predictions in physical space with nested MC sampling
 - Both default to `taus="auto"` which loads `taus.json` if present
-
+- Pass `taus=None` explicitly to disable temperature calibration
+- Saved training paths and `DEVICE` are not replayed during inference; runtime
+  placement comes from the current host or an explicit `device=` argument
