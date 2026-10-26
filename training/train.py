@@ -599,6 +599,7 @@ def main():
     frozen_flag = False
 
     for epoch in range(1, cfg.EPOCHS + 1):
+        beta = 1.0  # deterministic models have no KL warmup
 
         if is_bnn:
             model.alpha = 1.0  # no likelihood scaling
@@ -715,9 +716,12 @@ def main():
     print("[INFO] training complete")
 
     # 5)  temperature calibration (fit taus on val, apply to test) -----
-    from training.temp_tune import run_temp_tune
-    print("\n[INFO] running temperature calibration …")
-    run_temp_tune(run_dir)
+    if not is_bnn and cfg.UNCERTAINTY_MODE.lower() == "none":
+        print("[INFO] skipping calibration: no predicted uncertainty")
+    else:
+        from training.temp_tune import run_temp_tune
+        print("\n[INFO] running temperature calibration …")
+        run_temp_tune(run_dir)
 
     return run_dir
 

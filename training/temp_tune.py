@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Temperature calibration (tau fitting) for BNN uncertainty estimates.
 
-Fits a per-target scaling factor tau on the validation set so that the
-model's predictive intervals achieve nominal coverage.  Writes
+Fits per-target uncertainty factors by minimizing validation Gaussian NLL
+in latent space, then reports empirical predictive-interval coverage.  Writes
 ``taus.json`` and ``predictions_test_cal.csv`` into the run directory.
 
 Called automatically at the end of ``train.py``, or standalone::
@@ -18,6 +18,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import argparse
 import json
+import os
+import re
+import tempfile
 import numpy as np
 import pandas as pd
 import yaml
@@ -75,34 +78,89 @@ def gaussian_nll(mu, sigma, y):
     sigma = np.maximum(sigma, 1e-12)
     return 0.5 * np.log(2 * np.pi * sigma**2) + 0.5 * ((y - mu) ** 2) / (sigma**2)
 
+def _finite_array(values, name, *, nonnegative=False):
+    if np.iscomplexobj(values):
+        raise ValueError(f"{name} must contain finite real numbers")
+    try:
+        values = np.asarray(values, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must contain finite real numbers") from exc
+    if not np.all(np.isfinite(values)):
+        raise ValueError(f"{name} must contain finite real numbers")
+    if nonnegative and np.any(values < 0):
+        raise ValueError(f"{name} must be nonnegative")
+    return values
+
+
+def _latent_column(df, name, *, nonnegative=False):
+    if name not in df:
+        raise ValueError(f"Missing latent column {name!r}")
+    return _finite_array(df[name].to_numpy(), name, nonnegative=nonnegative)
+
+
 def fit_tau_per_target(mu_lat, std_tot_lat, t_true):
     """Fit per-target tau to scale total latent std by minimizing Gaussian NLL."""
+    mu_lat = _finite_array(mu_lat, "Validation means")
+    std_tot_lat = _finite_array(std_tot_lat, "Validation standard deviations", nonnegative=True)
+    t_true = _finite_array(t_true, "Validation transformed targets")
+    if (mu_lat.ndim != 2 or 0 in mu_lat.shape or
+            std_tot_lat.shape != mu_lat.shape or t_true.shape != mu_lat.shape):
+        raise ValueError("Validation arrays must have the same nonempty two-dimensional shape")
     taus = []
     for j in range(mu_lat.shape[1]):
         mu = mu_lat[:, j]
         sig = std_tot_lat[:, j]
+        # A multiplicative temperature cannot create uncertainty from zero.
+        # A whole zero-spread target has no identifiable tau, even with
+        # exact predictions; a positive-error zero-spread row has no finite
+        # Gaussian density and must not be hidden by the numerical floor.
+        if not np.any(sig > 0):
+            raise ValueError(f"Cannot calibrate zero uncertainty for target index {j}")
+        zero_error = (sig == 0) & (t_true[:, j] != mu)
+        if np.any(zero_error):
+            raise ValueError(f"Nonzero residual with zero uncertainty for target index {j}")
         y = t_true[:, j]
         def obj(log_tau):
             tau = np.exp(log_tau)
             return float(np.mean(gaussian_nll(mu, tau * sig, y)))
         res = minimize_scalar(obj, bounds=(-5, 5), method="bounded")
+        if not res.success or not np.isfinite(res.fun) or not np.isfinite(res.x):
+            raise ValueError(f"Temperature calibration failed for target index {j}")
+        # Bounded minimization can succeed at a boundary without fitting the
+        # required scale. Keep this visible without changing the saved format.
+        if abs(res.x) >= 5.0 - 1e-4:
+            import warnings
+            warnings.warn(f"Temperature for target index {j} reached its search bound",
+                          RuntimeWarning, stacklevel=2)
         taus.append(np.exp(res.x))
     return np.array(taus)
 
 # ---------------- utilities: detect whether per-sample posterior columns exist ----------------
 def _find_S_from_columns(df: pd.DataFrame, targets) -> int | None:
-    # look for mu_lat_s0_<t> columns
-    for t in targets:
-        if f"mu_lat_s0_{t}" not in df.columns:
-            return None
-    # count s until missing
-    s = 0
-    while True:
-        ok = all(f"mu_lat_s{s}_{t}" in df.columns for t in targets)
-        if not ok:
-            break
-        s += 1
-    return s if s > 0 else None
+    # Require matching, contiguous mean/noise draws for every requested target.
+    # Counting until the first missing column silently discards later samples.
+    draws = {(prefix, target): set() for target in targets
+             for prefix in ("mu_lat_s", "std_ale_lat_s")}
+    for column in df.columns:
+        match = re.fullmatch(r"(mu_lat_s|std_ale_lat_s)([^_]*)_(.*)", str(column))
+        if match is None or match[3] not in targets:
+            continue
+        try:
+            index = int(match[2])
+        except ValueError as exc:
+            raise ValueError("Invalid posterior sample index") from exc
+        if str(index) != match[2]:
+            raise ValueError("Noncanonical posterior sample index")
+        draws[(match[1], match[3])].add(index)
+    if not any(draws.values()):
+        return None
+    # Every group must contain the same zero-based contiguous draw indices.
+    # Use an observed group size, never a potentially huge maximum index.
+    expected = set(range(len(next(iter(draws.values())))))
+    if any(present != expected for present in draws.values()):
+        raise ValueError("Incomplete or noncontiguous posterior sample columns")
+    return len(expected)
+
 
 def load_latent_components(df: pd.DataFrame, targets):
     """
@@ -111,6 +169,10 @@ def load_latent_components(df: pd.DataFrame, targets):
     or
       (mode="gaussian",  mu_lat: (N,D), std_epi_lat: (N,D), std_ale_lat: (N,D))
     """
+    if df.empty:
+        raise ValueError("Calibration apply data must not be empty")
+    if not targets or not df.columns.is_unique:
+        raise ValueError("Calibration requires targets and unique input columns")
     S = _find_S_from_columns(df, targets)
     N = len(df)
     D = len(targets)
@@ -120,13 +182,24 @@ def load_latent_components(df: pd.DataFrame, targets):
         std_ale_lat_s = np.zeros((S, N, D), dtype=float)
         for j, t in enumerate(targets):
             for s in range(S):
-                mu_lat_s[s, :, j] = df[f"mu_lat_s{s}_{t}"].to_numpy()
-                std_ale_lat_s[s, :, j] = df[f"std_ale_lat_s{s}_{t}"].to_numpy()
+                mu_lat_s[s, :, j] = _latent_column(df, f"mu_lat_s{s}_{t}")
+                std_ale_lat_s[s, :, j] = _latent_column(df, f"std_ale_lat_s{s}_{t}", nonnegative=True)
         return "posterior", mu_lat_s, std_ale_lat_s
     # fallback Gaussian mode
-    mu_lat = np.stack([df[f"mu_lat_mean_{t}"].to_numpy() for t in targets], axis=1)
-    std_epi_lat = np.stack([df[f"std_epi_lat_{t}"].to_numpy() for t in targets], axis=1)
-    std_ale_lat = np.stack([df[f"std_ale_lat_{t}"].to_numpy() for t in targets], axis=1)
+    mu_lat = np.stack([_latent_column(df, f"mu_lat_mean_{t}") for t in targets], axis=1)
+    missing = [t for t in targets
+               if f"std_epi_lat_{t}" not in df and f"std_ale_lat_{t}" not in df]
+    if missing:
+        raise ValueError("Temperature calibration requires a latent uncertainty estimate "
+                         f"for each target; missing: {', '.join(missing)}")
+    std_epi_lat = np.stack([
+        _latent_column(df, f"std_epi_lat_{t}", nonnegative=True) if f"std_epi_lat_{t}" in df else np.zeros(N)
+        for t in targets
+    ], axis=1)
+    std_ale_lat = np.stack([
+        _latent_column(df, f"std_ale_lat_{t}", nonnegative=True) if f"std_ale_lat_{t}" in df else np.zeros(N)
+        for t in targets
+    ], axis=1)
     return "gaussian", mu_lat, std_epi_lat, std_ale_lat
 
 # ---------------- sampling + stats in physical space ----------------
@@ -159,23 +232,40 @@ def sample_phys_gaussian(mu_lat, std_epi_lat, std_ale_lat, tf_info, tf_eps, K: i
     y = inverse_phys_tf(t.reshape(K * L * N, D), tf_info, tf_eps).reshape(K, L, N, D)
     return y
 
-def stats_from_nested_cloud(y_kl: np.ndarray, quantiles=(0.05, 0.5, 0.95)):
+def stats_from_nested_cloud(y_kl: np.ndarray, quantiles=(0.05, 0.5, 0.95),
+                            *, epistemic_zero=None, aleatoric_zero=None):
+    """Estimate physical-space variance components from independent inner draws.
+
+    Remove finite-L Monte Carlo variance from the outer group means.
+    epistemic_zero/aleatoric_zero are known-absence masks broadcastable to
+    (N,D); they describe model components, not small estimated variances.
+    Corrected components are nonnegative and sum to total variance. Clipping
+    a noisy negative epistemic estimate at zero retains finite-sample bias.
+    Means and quantiles continue to use the original pooled sample cloud.
     """
-    y_kl: (K,L,N,D) where K indexes epistemic groups (posterior draws), L aleatoric draws.
-    """
+    y_kl = np.asarray(y_kl, dtype=np.float64)
+    if y_kl.ndim != 4 or 0 in y_kl.shape or not np.isfinite(y_kl).all():
+        raise ValueError("Expected a nonempty finite (K,L,N,D) sample cloud")
     K, L, N, D = y_kl.shape
+    epi_zero = np.broadcast_to(False if epistemic_zero is None else epistemic_zero, (N, D))
+    ale_zero = np.broadcast_to(False if aleatoric_zero is None else aleatoric_zero, (N, D))
+    if L < 2 and not np.all(ale_zero):
+        raise ValueError("L must be at least 2 to estimate aleatoric variance")
     y_pool = y_kl.reshape(K * L, N, D)
     mean = y_pool.mean(axis=0)
-    var_tot = y_pool.var(axis=0, ddof=0)
-    std_tot = np.sqrt(np.maximum(var_tot, 1e-24))
-    var_ale = y_kl.var(axis=1, ddof=0).mean(axis=0)          # E_k[Var_l]
-    var_epi = y_kl.mean(axis=1).var(axis=0, ddof=0)          # Var_k[E_l]
-    std_ale = np.sqrt(np.maximum(var_ale, 1e-24))
-    std_epi = np.sqrt(np.maximum(var_epi, 1e-24))
-    q_out = {}
-    for q in quantiles:
-        tag = f"q{int(round(q * 100)):02d}"
-        q_out[tag] = np.quantile(y_pool, q, axis=0)
+    var_ale = (y_kl.var(axis=1, ddof=1).mean(axis=0)
+               if L > 1 else np.zeros((N, D)))
+    var_ale = np.where(ale_zero, 0.0, var_ale)
+    var_means = y_kl.mean(axis=1).var(axis=0, ddof=0)
+    # For a finite K-point ensemble, independent mean-estimation errors
+    # contribute (1 - 1/K) * E[Var(Y|w)] / L to this population variance.
+    var_epi = np.maximum(var_means - (1.0 - 1.0 / K) * var_ale / L, 0.0)
+    var_epi = np.where(epi_zero, 0.0, var_epi)
+    std_ale = np.sqrt(var_ale)
+    std_epi = np.sqrt(var_epi)
+    std_tot = np.sqrt(var_ale + var_epi)
+    q_out = {f"q{int(round(q * 100)):02d}": np.quantile(y_pool, q, axis=0)
+             for q in quantiles}
     return mean, std_tot, std_ale, std_epi, q_out
 
 def write_outputs(df_in: pd.DataFrame, targets, out_csv: Path,
@@ -272,9 +362,13 @@ def run_temp_tune(
     Returns the fitted taus dict (also saved to run_dir/taus.json).
     Can be called programmatically after training without argparse.
     """
+    for name, value, minimum in (("K", K, 1), ("L", L, 1), ("seed", seed, 0)):
+        if (isinstance(value, (bool, np.bool_)) or
+                not isinstance(value, (int, np.integer)) or value < minimum):
+            raise ValueError(f"{name} must be an integer >= {minimum}")
     val_csv = val_csv or (run_dir / "predictions_val.csv")
     apply_csv = apply_csv or (run_dir / "predictions_test.csv")
-    out_csv = out_csv or (apply_csv.parent / (apply_csv.stem + "_cal.csv"))
+    out_csv = Path(out_csv) if out_csv is not None else (apply_csv.parent / (apply_csv.stem + "_cal.csv"))
 
     # load config used
     with (run_dir / "config_used.yaml").open("r") as f:
@@ -285,6 +379,9 @@ def run_temp_tune(
     tf_info = meta["tf_info"]
     tf_eps = cfg.TF_EPS
     targets = cfg.TARGETS
+    # Validate apply data before fitting or replacing saved calibration factors.
+    df_app = pd.read_csv(apply_csv)
+    mode, *parts = load_latent_components(df_app, targets)
     # ---------- fit tau on val (latent total std) ----------
     df_val = pd.read_csv(val_csv)
     for t in targets:
@@ -300,17 +397,12 @@ def run_temp_tune(
     for t, tau in zip(targets, taus):
         print(f"  {t}: tau={tau:.6f}")
 
-    # save taus to run_dir for reuse by inference_api
+    # Delay publishing calibration factors until all sampling succeeds.
+    # A failed output generation must not leave new taus with old results.
     taus_dict = {t: float(tau) for t, tau in zip(targets, taus)}
     taus_path = run_dir / "taus.json"
-    with taus_path.open("w") as fh:
-        json.dump(taus_dict, fh, indent=2)
-    print(f"[INFO] saved taus → {taus_path}")
 
     # ---------- apply tau + sample ----------
-    df_app = pd.read_csv(apply_csv)
-    mode, *parts = load_latent_components(df_app, targets)
-
     def run_with_taus(taus_used: np.ndarray):
         """Return df_out with q05/q50/q95 and mean/std columns added (in physical space)."""
         if mode == "posterior":
@@ -325,15 +417,21 @@ def run_temp_tune(
 
             y_kl = sample_phys_posterior(mu_lat_s_cal, std_ale_lat_s_cal, tf_info, tf_eps,
                                          L=L, seed=seed)
+            epistemic_zero = (np.all(mu_lat_s_cal == mu_lat_s_cal[:1], axis=0) &
+                               np.all(std_ale_lat_s_cal == std_ale_lat_s_cal[:1], axis=0))
+            aleatoric_zero = np.all(std_ale_lat_s_cal == 0, axis=0)
         else:
             mu_lat, std_epi_lat, std_ale_lat = parts
             std_epi_use = std_epi_lat * taus_used[None, :]
             std_ale_use = std_ale_lat * taus_used[None, :]
             y_kl = sample_phys_gaussian(mu_lat, std_epi_use, std_ale_use,
                                         tf_info, tf_eps, K=K, L=L, seed=seed)
+            epistemic_zero = std_epi_use == 0
+            aleatoric_zero = std_ale_use == 0
 
         mean, std_tot, std_ale, std_epi, q_out = stats_from_nested_cloud(
-            y_kl, quantiles=(0.05, 0.5, 0.95)
+            y_kl, quantiles=(0.05, 0.5, 0.95),
+            epistemic_zero=epistemic_zero, aleatoric_zero=aleatoric_zero,
         )
         # build dataframe in-memory (do not write)
         df_out = df_app.copy()
@@ -356,13 +454,32 @@ def run_temp_tune(
     print("\n[CAL] Post-calibration (fitted tau):")
     coverage_report(df_post, targets)
 
-    # write only post-cal outputs
-    df_post.to_csv(out_csv, index=False)
-    print(f"[INFO] wrote → {out_csv}")
-
     if out_sme_csv:
         write_sme(df_post, Path(out_sme_csv))
 
+    # Stage both outputs on their destination filesystems before publishing
+    # either file. Each os.replace() is atomic for its own file; the pair is
+    # not a multi-file transaction if a later replacement fails.
+    staged_csv = staged_taus = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="",
+                                         prefix=f".{out_csv.name}.", suffix=".tmp",
+                                         dir=out_csv.parent, delete=False) as stream:
+            staged_csv = Path(stream.name)
+            df_post.to_csv(stream, index=False)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                                         prefix=f".{taus_path.name}.", suffix=".tmp",
+                                         dir=taus_path.parent, delete=False) as stream:
+            staged_taus = Path(stream.name)
+            json.dump(taus_dict, stream, indent=2)
+        os.replace(staged_csv, out_csv)
+        os.replace(staged_taus, taus_path)
+    finally:
+        for staged in (staged_csv, staged_taus):
+            if staged is not None:
+                staged.unlink(missing_ok=True)
+    print(f"[INFO] wrote → {out_csv}")
+    print(f"[INFO] saved taus → {taus_path}")
     return taus_dict
 
 
