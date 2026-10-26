@@ -323,7 +323,9 @@ def run_inference_phys(
     # scale aleatoric std per posterior draw
     std_ale_lat_s_cal = tau_np[None, None, :] * std_ale_lat_s_np
 
-    # nested sampling in latent space
+    # nested sampling in latent space: marginal-only independent noise.
+    # Even in 'full' mode the learned off-diagonal covariance is not passed
+    # into this sampler, so cross-target aleatoric correlation is lost.
     rng = np.random.default_rng(seed)
     eps = rng.standard_normal(size=(S_eff, L, N, D)).astype(np.float32)
     t = mu_lat_s_cal[:, None, :, :] + std_ale_lat_s_cal[:, None, :, :] * eps  # (S,L,N,D)

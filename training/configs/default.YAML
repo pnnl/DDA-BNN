@@ -39,7 +39,7 @@ LAYER_SPEC:
 UNCERTAINTY_MODE: diag
 LOG_VAR_MIN:      -10
 LOG_VAR_MAX:      -3
-RHO_MAX:          0.4
+RHO_MAX:          0.4   # Cholesky off-diagonal bound; NOT Pearson rho (retrain full-cov models)
 
 # --------------- Bayesian controls -------------
 PRIOR_STD:         1
